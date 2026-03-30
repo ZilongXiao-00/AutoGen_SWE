@@ -18,14 +18,14 @@ User Proxy → Product Manager → Engineer → Code Reviewer → User Proxy →
 | **Product Manager** | 需求分析、功能规划、技术选型、风险评估 |
 | **Engineer** | 代码编写、技术实现、错误处理 |
 | **Code Reviewer** | 代码质量审查、安全检查、最佳实践验证 |
-| **User Proxy** | 任务发起、代码执行、结果验证、终止信号 |
+| **User Proxy** | 用户验收、功能测试、反馈收集 |
 
 ## Agent 技术能力
 
 ### 多智能体协作
 - **角色扮演**：每个智能体有明确的职责和专业知识
 - **轮转机制**：使用 `RoundRobinGroupChat` 实现有序协作
-- **终止控制**：通过 `TextMentionTermination` 自动检测任务完成
+- **终止控制**：双重终止条件 `TextMentionTermination` + `MaxMessageTermination`，防止无限循环
 
 ### AutoGen 框架特性
 - **流式输出**：实时展示智能体思考和对话过程
@@ -49,12 +49,11 @@ AutoGen_SWE/
 
 ## 工作流程
 
-1. **任务发起**：User Proxy 提交开发需求
-2. **需求分析**：Product Manager 分析需求，制定实现计划
-3. **编码实现**：Engineer 根据计划编写代码
-4. **代码审查**：Code Reviewer 检查代码质量，提出改进意见
-5. **验证执行**：如需调整，返回 Engineer 重写；如通过，User Proxy 执行测试
-6. **任务终止**：Code Reviewer 确认通过后输出 `TERMINATE`
+1. **需求分析**：Product Manager 分析需求，输出需求文档
+2. **编码实现**：Engineer 根据需求文档编写完整代码
+3. **代码审查**：Code Reviewer 审查代码质量，给出改进意见
+4. **迭代优化**：如有问题，Engineer 根据审查意见修改代码
+5. **任务终止**：Product Manager 确认所有需求已满足后输出 `TERMINATE`
 
 ## 快速运行
 
