@@ -5,7 +5,6 @@ from typing import Any, AsyncGenerator, List, Dict, Mapping, Optional, Sequence,
 import anthropic
 from dotenv import load_dotenv
 
-# AutoGen core types
 from autogen_core.models import (
     ChatCompletionClient,
     CreateResult,
@@ -28,10 +27,9 @@ load_dotenv()
 
 class CustomAnthropicClient(ChatCompletionClient):
     """
-    AutoGen-compatible model client that drives the Anthropic SDK directly.
-
-    Works with any base_url-compatible Anthropic endpoint (official API,
-    custom proxy, MiniMax, etc.) without needing autogen-ext[openai].
+    AutoGen-compatible model client built on top of the Anthropic SDK.
+    Works with any Anthropic-protocol endpoint (official, MiniMax, One-API…)
+    without depending on autogen-ext[openai].
     """
 
     def __init__(
@@ -48,11 +46,12 @@ class CustomAnthropicClient(ChatCompletionClient):
         self._client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
-        
+
     async def close(self) -> None:
-        """关闭客户端资源（如 aiohttp 会话）"""
-        # 如果你有需要关闭的 session，可以在这里写
-        # 如果没有，直接 pass 即可
+        """
+        关闭客户端并清理资源。
+        即使目前没有需要手动关闭的 session，也必须定义此方法。
+        """
         pass
     # ── AutoGen required interface ────────────────────────────────────────────
 
@@ -66,11 +65,10 @@ class CustomAnthropicClient(ChatCompletionClient):
         )
 
     @property
-    def capabilities(self):          # kept for backward-compat with older autogen
+    def capabilities(self):
         return self.model_info
 
     def count_tokens(self, messages: Sequence[LLMMessage], **kwargs) -> int:
-        # Rough estimate: 4 chars ≈ 1 token
         total = sum(len(str(m.content)) for m in messages)
         return total // 4
 
@@ -94,42 +92,36 @@ class CustomAnthropicClient(ChatCompletionClient):
     def _to_anthropic_messages(
         messages: Sequence[LLMMessage],
     ) -> tuple[str, list[dict]]:
-        """
-        Split AutoGen LLMMessage list into:
-          - system_prompt  (str)
-          - anthropic_messages  (list[dict])
-        """
+        """Convert AutoGen LLMMessage list → (system_prompt, anthropic_messages)."""
         system_prompt = ""
         anthropic_messages: list[dict] = []
 
         for msg in messages:
             if isinstance(msg, SystemMessage):
                 system_prompt = msg.content
+
             elif isinstance(msg, UserMessage):
                 content = msg.content
                 if isinstance(content, list):
-                    # MultiModal content — extract text parts
-                    parts = []
-                    for part in content:
-                        if hasattr(part, "text"):
-                            parts.append({"type": "text", "text": part.text})
-                    content = parts if parts else str(content)
-                anthropic_messages.append(
-                    {"role": "user", "content": content}
-                )
+                    parts = [
+                        {"type": "text", "text": part.text}
+                        for part in content
+                        if hasattr(part, "text")
+                    ]
+                    content = parts or str(content)
+                anthropic_messages.append({"role": "user", "content": content})
+
             elif isinstance(msg, AssistantMessage):
                 anthropic_messages.append(
                     {"role": "assistant", "content": str(msg.content)}
                 )
+
             elif isinstance(msg, FunctionExecutionResultMessage):
-                # Represent tool results as a user turn (simple fallback)
                 results_text = "\n".join(
                     f"[Tool result for {r.call_id}]: {r.content}"
                     for r in msg.content
                 )
-                anthropic_messages.append(
-                    {"role": "user", "content": results_text}
-                )
+                anthropic_messages.append({"role": "user", "content": results_text})
 
         return system_prompt, anthropic_messages
 
@@ -147,26 +139,31 @@ class CustomAnthropicClient(ChatCompletionClient):
 
         system_prompt, anthropic_messages = self._to_anthropic_messages(messages)
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: self._client.messages.create(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                system=system_prompt,
-                messages=anthropic_messages,
-                temperature=self._temperature,
-                **extra_create_args,
-            ),
-        )
+        # ⚠️  Must use get_running_loop() inside an async context (Python ≥ 3.10)
+        loop = asyncio.get_running_loop()
 
-        # Collect text blocks; skip thinking blocks
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._client.messages.create(
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    system=system_prompt,
+                    messages=anthropic_messages,
+                    temperature=self._temperature,
+                    **extra_create_args,
+                ),
+            )
+        except Exception as exc:
+            # Surface the error instead of swallowing it — agents will fail
+            # loudly rather than silently producing empty messages.
+            raise RuntimeError(f"[CustomAnthropicClient] API call failed: {exc}") from exc
+
         reply_text = ""
         for block in response.content:
             if block.type == "text":
                 reply_text += block.text
-            elif block.type == "thinking":
-                pass  # visible only in streaming mode
+            # thinking blocks are intentionally skipped in non-stream mode
 
         usage = RequestUsage(
             prompt_tokens=response.usage.input_tokens,
@@ -197,34 +194,42 @@ class CustomAnthropicClient(ChatCompletionClient):
 
         system_prompt, anthropic_messages = self._to_anthropic_messages(messages)
         collected: list[str] = []
-        loop = asyncio.get_event_loop()
-        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        # ⚠️  get_running_loop() — correct inside async context
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Optional[str | Exception]] = asyncio.Queue()
 
         def _stream_worker():
-            with self._client.messages.stream(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                system=system_prompt,
-                messages=anthropic_messages,
-                temperature=self._temperature,
-                **extra_create_args,
-            ) as stream:
-                for event in stream:
-                    if event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            asyncio.run_coroutine_threadsafe(
-                                queue.put(event.delta.text), loop
-                            )
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
+            try:
+                with self._client.messages.stream(
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    system=system_prompt,
+                    messages=anthropic_messages,
+                    temperature=self._temperature,
+                    **extra_create_args,
+                ) as stream:
+                    for event in stream:
+                        if event.type == "content_block_delta":
+                            if event.delta.type == "text_delta":
+                                asyncio.run_coroutine_threadsafe(
+                                    queue.put(event.delta.text), loop
+                                )
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(queue.put(exc), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
 
         loop.run_in_executor(None, _stream_worker)
 
         while True:
-            chunk = await queue.get()
-            if chunk is None:
+            item = await queue.get()
+            if item is None:
                 break
-            collected.append(chunk)
-            yield chunk
+            if isinstance(item, Exception):
+                raise RuntimeError(f"[CustomAnthropicClient] Stream error: {item}") from item
+            collected.append(item)
+            yield item
 
         full_text = "".join(collected)
         yield CreateResult(
@@ -237,7 +242,7 @@ class CustomAnthropicClient(ChatCompletionClient):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Factory — used by RoundRobinGroupChat.py
+# 2.  Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_autogen_model_client(
@@ -247,12 +252,8 @@ def create_autogen_model_client(
     max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> CustomAnthropicClient:
-    """
-    读取参数（优先函数参数，fallback 到环境变量）并返回
-    AutoGen 兼容的 CustomAnthropicClient。
-    """
-    model = model or os.getenv("LLM_MODEL_ID")
-    api_key = api_key or os.getenv("LLM_API_KEY")
+    model    = model    or os.getenv("LLM_MODEL_ID")
+    api_key  = api_key  or os.getenv("LLM_API_KEY")
     base_url = base_url or os.getenv("LLM_BASE_URL")
 
     if not all([model, api_key, base_url]):
@@ -268,16 +269,14 @@ def create_autogen_model_client(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Standalone LLM class (保留，用于脚本/测试直接调用，与 AutoGen 无关)
+# 3.  Standalone LLM class（独立测试用，与 AutoGen 无关）
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LLM:
-    """直接使用 anthropic SDK 的独立客户端。"""
-
     def __init__(self, model: str = None, apiKey: str = None, baseUrl: str = None):
         self.model = model or os.getenv("LLM_MODEL_ID")
-        api_key = apiKey or os.getenv("LLM_API_KEY")
-        base_url = baseUrl or os.getenv("LLM_BASE_URL")
+        api_key    = apiKey   or os.getenv("LLM_API_KEY")
+        base_url   = baseUrl  or os.getenv("LLM_BASE_URL")
 
         if not all([self.model, api_key, base_url]):
             raise ValueError("模型ID、API密钥和服务地址不能为空。")
@@ -288,7 +287,7 @@ class LLM:
         print(f"🧠 正在通过 Anthropic 协议调用 {self.model} 模型...")
 
         system_content = ""
-        user_messages = []
+        user_messages  = []
         for msg in messages:
             if msg["role"] == "system":
                 system_content = msg["content"]
@@ -308,15 +307,10 @@ class LLM:
                 for event in stream:
                     if event.type == "content_block_delta":
                         if event.delta.type == "thinking_delta":
-                            print(
-                                f"\033[90m{event.delta.thinking}\033[0m",
-                                end="",
-                                flush=True,
-                            )
+                            print(f"\033[90m{event.delta.thinking}\033[0m", end="", flush=True)
                         elif event.delta.type == "text_delta":
                             print(event.delta.text, end="", flush=True)
                             collected_text.append(event.delta.text)
-
             print()
             return "".join(collected_text)
 
@@ -325,11 +319,9 @@ class LLM:
             return None
 
 
-# ── 快速测试入口 ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     llm_client = LLM()
-    example_messages = [
+    llm_client.think([
         {"role": "system", "content": "你是一个严谨的助手。"},
-        {"role": "user", "content": "1.11 和 1.9 哪个大？"},
-    ]
-    llm_client.think(example_messages)
+        {"role": "user",   "content": "1.11 和 1.9 哪个大？"},
+    ])

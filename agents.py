@@ -17,13 +17,17 @@ def create_product_manager(model_client):
 4. 实现优先级排序
 5. 验收标准定义
 
-请简洁明了地回应，并在分析完成后说"请工程师开始实现"。"""
+请简洁明了地回应，并在分析完成后说"请工程师开始实现"。
+
+当所有需求已实现且代码通过审查时，在消息末尾单独一行输出：TERMINATE"""
 
     return AssistantAgent(
         name="ProductManager",
+        description="产品经理，负责需求分析、功能定义和最终验收。",
         model_client=model_client,
         system_message=system_message,
     )
+
 
 def create_engineer(model_client):
     """创建软件工程师智能体"""
@@ -46,9 +50,11 @@ def create_engineer(model_client):
 
     return AssistantAgent(
         name="Engineer",
+        description="全栈工程师，负责根据需求编写完整、可运行的代码。",
         model_client=model_client,
         system_message=system_message,
     )
+
 
 def create_code_reviewer(model_client):
     """创建代码审查员智能体"""
@@ -71,19 +77,19 @@ def create_code_reviewer(model_client):
 
     return AssistantAgent(
         name="CodeReviewer",
+        description="代码审查员，负责审查代码质量、正确性和最佳实践。",
         model_client=model_client,
         system_message=system_message,
     )
+
 
 def create_user_proxy():
     """创建用户代理智能体"""
     return UserProxyAgent(
         name="UserProxy",
-        description="""用户代理，负责以下职责：
-1. 代表用户提出开发需求
-2. 执行最终的代码实现
-3. 验证功能是否符合预期
-4. 提供用户反馈和建议
-
-完成测试后请回复 TERMINATE。""",
+        # ⚠️  description 中不能含有 "TERMINATE"：
+        #     TextMentionTermination 会扫描所有消息（含 description 注入的内容），
+        #     一旦发现就立即终止，导致只进行 1 轮对话。
+        #     终止信号统一由 ProductManager 在确认完成后发出。
+        description="用户代理，代表最终用户对完成的功能进行验收和反馈。",
     )
