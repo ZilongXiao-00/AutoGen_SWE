@@ -1,5 +1,7 @@
 # AutoGen SWE
 
+![AutoGen SWE Cover](./AutoGen_SWE.png)
+
 基于 **Microsoft AutoGen** 框架的多智能体软件开发团队，模拟真实开发流程进行协作式代码生成。
 
 ## 核心思想
